@@ -1,0 +1,12 @@
+{
+  "domain": "jbl_ma",
+  "name": "JBL MA AVR",
+  "version": "0.3.0",
+  "documentation": "https://github.com/ANG-Ventures/ha-jbl-ma",
+  "issue_tracker": "https://github.com/ANG-Ventures/ha-jbl-ma/issues",
+  "requirements": [],
+  "codeowners": ["@angalexg"],
+  "iot_class": "local_polling",
+  "integration_type": "device",
+  "config_flow": true
+}

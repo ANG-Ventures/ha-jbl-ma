@@ -1,0 +1,23 @@
+{
+  "config": {
+    "step": {
+      "user": {
+        "title": "JBL MA AVR",
+        "description": "Connect to a JBL MA Series AV receiver via IP Control (TCP port 50000).",
+        "data": {
+          "host": "Host",
+          "name": "Name",
+          "port": "Port",
+          "scan_interval": "Polling interval (seconds)"
+        }
+      }
+    },
+    "error": {
+      "cannot_connect": "Cannot connect to the receiver. Check the IP address and port.",
+      "unknown": "Unexpected error. Check logs for details."
+    },
+    "abort": {
+      "already_configured": "This receiver is already configured."
+    }
+  }
+}
