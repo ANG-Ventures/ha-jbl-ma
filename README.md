@@ -118,7 +118,7 @@ Creates a `media_player` entity with:
 
 This integration implements the **JBL IP Control Protocol v1.5** — a binary TCP protocol on port 50000.
 
-- [Official JBL IP Control Spec (PDF)](https://www.jbl.com/on/demandware.static/-/Sites-masterCatalog_Harman/default/dw786f5b64/pdfs/IPControl_MA_Series_v15.pdf)
+- [Official JBL IP Control Spec (PDF)](docs/IPControl_MA_Series_v15.pdf) ([original link](https://www.jbl.com/on/demandware.static/-/Sites-masterCatalog_Harman/default/dw786f5b64/pdfs/IPControl_MA_Series_v15.pdf))
 
 ### Frame Format
 
