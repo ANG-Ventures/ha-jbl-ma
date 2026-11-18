@@ -64,6 +64,7 @@ SOURCE_MAP = {
     "HDMI4": 0x04,
     "HDMI5": 0x05,
     "HDMI6": 0x06,
+    "HDMI7": 0x07,
     "Coax": 0x08,
     "Optical": 0x09,
     "Analog1": 0x0A,
@@ -106,7 +107,8 @@ class JBLMAClient:
         return bytes([START, cmd_id, len(data), *data, END])
 
     async def _open(self):
-        return await asyncio.open_connection(self.host, self.port)
+        # Bounded: an amp off the LAN otherwise holds platform setup for the OS SYN timeout (~130 s).
+        return await asyncio.wait_for(asyncio.open_connection(self.host, self.port), timeout=5)
 
     def _split_frames(self, raw: bytes) -> list[bytes]:
         frames: list[bytes] = []
@@ -238,7 +240,7 @@ class JBLMAClient:
 
 async def async_setup_platform(hass: HomeAssistant, config, async_add_entities: AddEntitiesCallback, discovery_info=None) -> None:
     try:
-        async_add_entities([await _build_entity(hass, dict(config))])
+        async_add_entities([await _build_entity(hass, dict(config), has_config_entry=False)])
     except Exception as err:
         _LOGGER.error("JBL MA platform setup failed: %s", err, exc_info=True)
         raise
@@ -246,10 +248,10 @@ async def async_setup_platform(hass: HomeAssistant, config, async_add_entities: 
 
 async def async_setup_entry(hass: HomeAssistant, entry, async_add_entities: AddEntitiesCallback) -> None:
     data = dict(entry.data)
-    async_add_entities([await _build_entity(hass, data)])
+    async_add_entities([await _build_entity(hass, data, has_config_entry=True)])
 
 
-async def _build_entity(hass: HomeAssistant, data: dict):
+async def _build_entity(hass: HomeAssistant, data: dict, has_config_entry: bool):
     host = data[CONF_HOST]
     port = data.get(CONF_PORT, DEFAULT_PORT)
     name = data.get(CONF_NAME, "Theater JBL AV")
@@ -275,7 +277,7 @@ async def _build_entity(hass: HomeAssistant, data: dict):
         await coordinator.async_refresh()
     except Exception as err:
         _LOGGER.warning("JBL MA initial refresh failed (will retry): %s", err)
-    return JBLMAMediaPlayer(coordinator, client, name, host, port, sources)
+    return JBLMAMediaPlayer(coordinator, client, name, host, port, sources, has_config_entry)
 
 
 class JBLMAMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
@@ -289,7 +291,7 @@ class JBLMAMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
         | MediaPlayerEntityFeature.SELECT_SOURCE
     )
 
-    def __init__(self, coordinator: DataUpdateCoordinator, client: JBLMAClient, name: str, host: str, port: int, sources: list[str]) -> None:
+    def __init__(self, coordinator: DataUpdateCoordinator, client: JBLMAClient, name: str, host: str, port: int, sources: list[str], has_config_entry: bool) -> None:
         super().__init__(coordinator)
         self._client = client
         self._attr_name = name
@@ -297,18 +299,24 @@ class JBLMAMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
         self._attr_source_list = sources
         self._host = host
         self._port = port
-        self._attr_device_info = DeviceInfo(
-            identifiers={(DOMAIN, f"{host}_{port}")},
-            name=name,
-            manufacturer="JBL / Harman International",
-            model="MA7100HP",
-            sw_version=None,
-        )
+        # Device info only with a config entry: HA 2027.8 refuses a device on a YAML-platform entity.
+        if has_config_entry:
+            self._attr_device_info = DeviceInfo(
+                identifiers={(DOMAIN, f"{host}_{port}")},
+                name=name,
+                manufacturer="JBL / Harman International",
+                model="MA7100HP",
+                sw_version=None,
+            )
 
     @property
     def state(self):
         status = self.coordinator.data
-        if status.ip_control_version and self._attr_device_info:
+        if status is None:
+            # First refresh failed (amp down at boot). Raising here aborts the entity add and the
+            # platform never retries, leaving a restored placeholder until the next core restart.
+            return None
+        if status.ip_control_version and getattr(self, "_attr_device_info", None):
             self._attr_device_info["sw_version"] = status.ip_control_version
         if status.is_on is True:
             return MediaPlayerState.ON
@@ -331,6 +339,8 @@ class JBLMAMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
     @property
     def extra_state_attributes(self):
         status = self.coordinator.data
+        if status is None:
+            return {"host": self._host, "port": self._port}
         return {
             "jbl_raw": status.raw.hex() if status.raw else None,
             "protocol_validated": status.protocol_validated,
@@ -340,13 +350,27 @@ class JBLMAMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
             "port": self._port,
         }
 
+
+    async def _safe_refresh_after_command(self, settle: float = 1.5) -> None:
+        """Wait for receiver to settle, then refresh; tolerate transient failures."""
+        await asyncio.sleep(settle)
+        for attempt in range(2):
+            try:
+                await self.coordinator.async_refresh()
+                if self.coordinator.last_update_success:
+                    return
+            except Exception as err:
+                _LOGGER.debug("post-command refresh attempt %d failed: %s", attempt, err)
+            await asyncio.sleep(1.5)
+        _LOGGER.debug("post-command refresh gave up; will recover on next poll")
+
     async def async_turn_on(self) -> None:
         await self._client.async_send_command(CMD_POWER, b"\x01")
-        await self.coordinator.async_request_refresh()
+        await self._safe_refresh_after_command()
 
     async def async_turn_off(self) -> None:
         await self._client.async_send_command(CMD_POWER, b"\x00")
-        await self.coordinator.async_request_refresh()
+        await self._safe_refresh_after_command()
 
     async def async_volume_up(self) -> None:
         current = self.coordinator.data.volume_level
@@ -354,7 +378,7 @@ class JBLMAMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
             return
         new_vol = min(99, int(current * 99) + 3)
         await self._client.async_send_command(CMD_VOLUME, bytes([new_vol]))
-        await self.coordinator.async_request_refresh()
+        await self._safe_refresh_after_command()
 
     async def async_volume_down(self) -> None:
         current = self.coordinator.data.volume_level
@@ -362,23 +386,29 @@ class JBLMAMediaPlayer(CoordinatorEntity, MediaPlayerEntity):
             return
         new_vol = max(0, int(current * 99) - 3)
         await self._client.async_send_command(CMD_VOLUME, bytes([new_vol]))
-        await self.coordinator.async_request_refresh()
+        await self._safe_refresh_after_command()
 
     async def async_set_volume_level(self, volume: float) -> None:
-        raw_vol = max(0, min(99, int(volume * 99)))
+        raw_vol = max(0, min(99, round(volume * 99)))
         await self._client.async_send_command(CMD_VOLUME, bytes([raw_vol]))
-        await self.coordinator.async_request_refresh()
+        await self._safe_refresh_after_command()
 
     async def async_mute_volume(self, mute: bool) -> None:
         current = getattr(self.coordinator.data, "muted", None)
         if current is not None and current == mute:
             return
         await self._client.async_send_command(CMD_MUTE, b"\x01" if mute else b"\x00")
-        await self.coordinator.async_request_refresh()
+        await self._safe_refresh_after_command()
 
     async def async_select_source(self, source: str) -> None:
         source_code = SOURCE_MAP.get(source)
         if source_code is None:
             raise ValueError(f"unsupported JBL MA source: {source}")
+        # The MA7100 sometimes returns a status/event frame instead of the expected
+        # source-command ack when asked to re-select the already-active input.
+        # Treat active-source taps as a no-op so Lovelace buttons don't surface
+        # a bogus "command id mismatch" error.
+        if getattr(self.coordinator.data, "source", None) == source:
+            return
         await self._client.async_send_command(CMD_SOURCE, bytes([source_code]))
-        await self.coordinator.async_request_refresh()
+        await self._safe_refresh_after_command()
