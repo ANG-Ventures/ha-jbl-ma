@@ -62,6 +62,7 @@ def _install_stubs() -> None:
     class DataUpdateCoordinator:
         def __init__(self, hass, logger, name, update_method, update_interval):
             self.data = None  # amp not reached: first refresh produced no data
+            self.update_method = update_method  # tests drive polls by hand
             self.last_update_success = False
 
         async def async_refresh(self):
@@ -139,6 +140,112 @@ class YamlPlatformTests(unittest.TestCase):
         ent.coordinator.data = mp.JBLMAStatus(is_on=True, ip_control_version="1.5")
         self.assertEqual(ent.state, "on")
         self.assertIsNone(getattr(ent, "_attr_device_info", None))
+
+
+class _FakeClient:
+    """Stands in for JBLMAClient: async_get_status returns or raises what the test queues."""
+
+    results: list = []
+
+    def __init__(self, host, port):
+        pass
+
+    async def async_get_status(self):
+        r = _FakeClient.results.pop(0)
+        if isinstance(r, Exception):
+            raise r
+        return r
+
+
+class StaleGraceTests(unittest.TestCase):
+    """A ~25 s Ethernet link bounce (switch port 9 link down/up) must not make the entity unavailable."""
+
+    def setUp(self):
+        self.mp = _load_media_player()
+        self.mp.JBLMAClient = _FakeClient
+        self.clock = [1000.0]
+        self.mp._now = lambda: self.clock[0]
+        added = []
+        asyncio.run(self.mp.async_setup_platform(object(), dict(YAML_CONFIG), added.extend))
+        self.poll = added[0].coordinator.update_method
+
+    def test_one_missed_poll_keeps_last_state(self):
+        good = self.mp.JBLMAStatus(is_on=True, source="HDMI2")
+        _FakeClient.results = [good, asyncio.TimeoutError()]
+        self.assertIs(asyncio.run(self.poll()), good)
+        self.clock[0] += 35  # next poll lands inside the bounce
+        self.assertIs(asyncio.run(self.poll()), good)
+
+    def test_two_missed_polls_still_inside_grace(self):
+        good = self.mp.JBLMAStatus(is_on=True)
+        _FakeClient.results = [good, OSError("no route"), OSError("no route")]
+        asyncio.run(self.poll())
+        self.clock[0] += 35
+        asyncio.run(self.poll())
+        self.clock[0] += 31  # 66 s since the last good poll
+        self.assertIs(asyncio.run(self.poll()), good)
+
+    def test_outage_longer_than_grace_goes_unavailable(self):
+        good = self.mp.JBLMAStatus(is_on=True)
+        _FakeClient.results = [good, asyncio.TimeoutError()]
+        asyncio.run(self.poll())
+        self.clock[0] += self.mp.STALE_GRACE_SECONDS + 1
+        with self.assertRaises(Exception) as cm:
+            asyncio.run(self.poll())
+        self.assertIn("TimeoutError", str(cm.exception))
+
+    def test_failure_with_no_good_poll_yet_raises(self):
+        _FakeClient.results = [asyncio.TimeoutError()]
+        with self.assertRaises(Exception):
+            asyncio.run(self.poll())
+
+
+class CommandRetryTests(unittest.TestCase):
+    def setUp(self):
+        self.mp = _load_media_player()
+        self.calls = 0
+        self._real = (asyncio.open_connection, asyncio.sleep)
+
+        async def fake_open(host, port):
+            self.calls += 1
+            if self.calls <= self.fail_first:
+                raise OSError("Host is down")
+            return ("reader", "writer")
+
+        async def no_sleep(_s):
+            return None
+
+        asyncio.open_connection = fake_open
+        asyncio.sleep = no_sleep
+
+    def tearDown(self):
+        asyncio.open_connection, asyncio.sleep = self._real
+
+    def test_open_retries_through_a_bounce(self):
+        self.fail_first = 2
+        c = self.mp.JBLMAClient("192.168.1.134", 50000)
+        self.assertEqual(asyncio.run(c._open(self.mp.COMMAND_CONNECT_ATTEMPTS)), ("reader", "writer"))
+        self.assertEqual(self.calls, 3)
+
+    def test_poll_open_does_not_retry(self):
+        self.fail_first = 1
+        c = self.mp.JBLMAClient("192.168.1.134", 50000)
+        with self.assertRaises(OSError):
+            asyncio.run(c._open())
+        self.assertEqual(self.calls, 1)
+
+    def test_send_command_uses_command_attempts(self):
+        c = self.mp.JBLMAClient("192.168.1.134", 50000)
+        c._validated = True
+        seen = []
+
+        async def fake_exchange(cmd_id, data=b"", attempts=1):
+            seen.append(attempts)
+            return []
+
+        c._exchange = fake_exchange
+        asyncio.run(c.async_send_command(self.mp.CMD_POWER, b"\x01"))
+        self.assertEqual(seen, [self.mp.COMMAND_CONNECT_ATTEMPTS])
 
 
 if __name__ == "__main__":

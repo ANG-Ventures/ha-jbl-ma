@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 from dataclasses import dataclass
 from datetime import timedelta
 
@@ -17,6 +18,7 @@ from homeassistant.helpers.device_registry import DeviceInfo
 from homeassistant.helpers.update_coordinator import CoordinatorEntity, DataUpdateCoordinator, UpdateFailed
 
 from .const import (
+    COMMAND_CONNECT_ATTEMPTS,
     CONF_PORT,
     CONF_SCAN_INTERVAL,
     CONF_SOURCES,
@@ -24,9 +26,11 @@ from .const import (
     DEFAULT_SCAN_INTERVAL,
     DEFAULT_SOURCES,
     DOMAIN,
+    STALE_GRACE_SECONDS,
 )
 
 _LOGGER = logging.getLogger(__name__)
+_now = time.monotonic  # patched by tests
 
 PLATFORM_SCHEMA = PLATFORM_SCHEMA.extend(
     {
@@ -106,9 +110,15 @@ class JBLMAClient:
     def _build_packet(self, cmd_id: int, data: bytes = b"") -> bytes:
         return bytes([START, cmd_id, len(data), *data, END])
 
-    async def _open(self):
+    async def _open(self, attempts: int = 1):
         # Bounded: an amp off the LAN otherwise holds platform setup for the OS SYN timeout (~130 s).
-        return await asyncio.wait_for(asyncio.open_connection(self.host, self.port), timeout=5)
+        for attempt in range(attempts):
+            try:
+                return await asyncio.wait_for(asyncio.open_connection(self.host, self.port), timeout=5)
+            except (OSError, asyncio.TimeoutError):
+                if attempt + 1 >= attempts:
+                    raise
+                await asyncio.sleep(2**attempt)  # 1, 2, 4 s: rides out a ~25 s link bounce
 
     def _split_frames(self, raw: bytes) -> list[bytes]:
         frames: list[bytes] = []
@@ -138,9 +148,9 @@ class JBLMAClient:
             raise JBLMAProtocolError(f"device returned error rsp=0x{rsp_code:02x} for cmd=0x{cmd_id:02x}")
         return cmd_id, rsp_code, data
 
-    async def _exchange(self, cmd_id: int, data: bytes = b"") -> list[tuple[int, int, bytes]]:
+    async def _exchange(self, cmd_id: int, data: bytes = b"", attempts: int = 1) -> list[tuple[int, int, bytes]]:
         payload = self._build_packet(cmd_id, data)
-        reader, writer = await self._open()
+        reader, writer = await self._open(attempts)
         try:
             writer.write(payload)
             await writer.drain()
@@ -235,7 +245,7 @@ class JBLMAClient:
 
     async def async_send_command(self, cmd_id: int, data: bytes = b"") -> None:
         await self.async_validate_protocol()
-        await self._exchange(cmd_id, data)
+        await self._exchange(cmd_id, data, attempts=COMMAND_CONNECT_ATTEMPTS)
 
 
 async def async_setup_platform(hass: HomeAssistant, config, async_add_entities: AddEntitiesCallback, discovery_info=None) -> None:
@@ -259,12 +269,20 @@ async def _build_entity(hass: HomeAssistant, data: dict, has_config_entry: bool)
     scan_interval = int(_si.total_seconds()) if hasattr(_si, "total_seconds") else int(_si)
     sources = data.get(CONF_SOURCES, DEFAULT_SOURCES)
     client = JBLMAClient(host, port)
+    last_good: dict = {}
 
     async def _async_update() -> JBLMAStatus:
         try:
-            return await client.async_get_status()
+            status = await client.async_get_status()
         except Exception as err:
-            raise UpdateFailed(f"JBL MA update failed: {err}") from err
+            age = _now() - last_good["at"] if last_good else None
+            if age is not None and age < STALE_GRACE_SECONDS:
+                # Link bounce: keep the last good status for a short grace instead of going unavailable.
+                _LOGGER.warning("JBL MA poll failed (%r); keeping last state, %.0f s old", err, age)
+                return last_good["status"]
+            raise UpdateFailed(f"JBL MA update failed: {err!r}") from err
+        last_good.update(status=status, at=_now())
+        return status
 
     coordinator = DataUpdateCoordinator(
         hass,
